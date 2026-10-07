@@ -104,7 +104,6 @@ impl MemTable {
         let key = Bytes::copy_from_slice(_key);
         let value = Bytes::copy_from_slice(_value);
         let len = key.len() + value.len();
-        println!("Adding {len} bytes of data to memtable");
         self.approximate_size
             .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         self.map.insert(key, value);
@@ -125,7 +124,20 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+        let mut x = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |map| {
+                map.range((
+                    _lower.map(Bytes::copy_from_slice),
+                    _upper.map(Bytes::copy_from_slice),
+                ))
+            },
+            item: (Bytes::new(), Bytes::new()),
+            valid: false,
+        }
+        .build();
+        x.advance();
+        x
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -165,24 +177,43 @@ pub struct MemTableIterator {
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
+    valid: bool,
+}
+
+impl MemTableIterator {
+    fn advance(&mut self) {
+        self.with_mut(|fields| match fields.iter.next() {
+            Some(entry) => {
+                *fields.valid = true;
+                *fields.item = (entry.key().clone(), entry.value().clone())
+            }
+            None => {
+                *fields.valid = false;
+            }
+        });
+    }
 }
 
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().1.as_ref()
     }
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        KeySlice::from_slice(self.borrow_item().0.as_ref())
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        *self.borrow_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !*(self.borrow_valid()) {
+            return Err(anyhow::anyhow!("Iterator has no valid elements"));
+        }
+        self.advance();
+        Ok(())
     }
 }

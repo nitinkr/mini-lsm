@@ -30,6 +30,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -321,10 +322,6 @@ impl LsmStorageInner {
             let r1 = self.state.read();
             r1.memtable.put(_key, _value)?;
             let approx_size = r1.memtable.approximate_size();
-            println!(
-                "approx size after put {approx_size} -- target size {}",
-                self.options.target_sst_size
-            );
             r1.memtable.approximate_size() >= self.options.target_sst_size
         };
 
@@ -342,9 +339,7 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        //let r1 = self.state.read();
         let value = vec![];
-        //r1.memtable.put(_key, &value)
         self.put(_key, &value)
     }
 
@@ -398,6 +393,13 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let guard = self.state.read();
+        let mut iters = vec![Box::new(guard.memtable.scan(_lower, _upper))];
+        for i in guard.imm_memtables.iter() {
+            iters.push(Box::new(i.scan(_lower, _upper)));
+        }
+        let h_iter = MergeIterator::create(iters);
+        let lsm_iter = LsmIterator::new(h_iter)?;
+        Ok(FusedIterator::<LsmIterator>::new(lsm_iter))
     }
 }
