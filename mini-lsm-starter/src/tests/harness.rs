@@ -173,7 +173,6 @@ where
 {
     for (k, v) in expected {
         assert!(iter.is_valid());
-        println!("{:?} -> {:?} ", as_bytes(iter.key()), iter.value());
         assert_eq!(
             k,
             iter.key(),
