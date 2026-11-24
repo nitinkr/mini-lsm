@@ -23,10 +23,11 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 pub use builder::SsTableBuilder;
-use bytes::Buf;
+use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
+use std::ops::Bound;
 
 use crate::block::Block;
 use crate::key::{KeyBytes, KeySlice};
@@ -53,12 +54,43 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
-        unimplemented!()
+        for meta in block_meta {
+            meta.encode(buf);
+        }
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+        let mut metas = vec![];
+        while buf.has_remaining() {
+            // metas.push(BlockMeta::decode_block(&mut buf));
+            let meta_offset: usize = buf.get_u32() as usize;
+
+            // first key
+            let first_key_len = buf.get_u16() as usize;
+            let first_key_bytes = buf.copy_to_bytes(first_key_len);
+
+            // last key
+            let last_key_len = buf.get_u16() as usize;
+            let last_key_bytes = buf.copy_to_bytes(last_key_len);
+
+            metas.push(BlockMeta {
+                offset: meta_offset,
+                first_key: KeyBytes::from_bytes(first_key_bytes),
+                last_key: KeyBytes::from_bytes(last_key_bytes),
+            });
+        }
+        metas
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.put_u32(self.offset as u32);
+
+        buf.put_u16(self.first_key.len() as u16);
+        buf.extend_from_slice(self.first_key.raw_ref());
+
+        buf.put_u16(self.last_key.len() as u16);
+        buf.extend_from_slice(self.last_key.raw_ref());
     }
 }
 
@@ -117,12 +149,46 @@ pub struct SsTable {
 impl SsTable {
     #[cfg(test)]
     pub(crate) fn open_for_test(file: FileObject) -> Result<Self> {
-        Self::open(0, None, file)
+        Self::open(0, Some(Arc::new(BlockCache::new(1000))), file)
     }
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let mut curr_end = file.1;
+        // get bloom filter up and running
+        let bloom_offset =
+            u32::from_be_bytes(file.read(curr_end - 4, 4)?.try_into().unwrap()) as usize;
+        curr_end -= 4;
+        let bloom_block_len = curr_end as usize - bloom_offset;
+        let data = file.read(bloom_offset as u64, bloom_block_len as u64)?;
+        let bloom = Bloom::decode(data.as_ref())?;
+
+        curr_end = bloom_offset as u64;
+
+        let mut sstable = SsTable {
+            file,
+            block_meta: vec![],
+            block_meta_offset: 0,
+            id,
+            block_cache,
+            first_key: KeyBytes::from_bytes(Bytes::new()),
+            last_key: KeyBytes::from_bytes(Bytes::new()),
+            bloom: Some(bloom),
+            max_ts: 0,
+        };
+
+        sstable.block_meta_offset =
+            u32::from_be_bytes(sstable.file.read(curr_end - 4, 4)?.try_into().unwrap()) as usize;
+        curr_end -= 4;
+        let meta_block_len = (curr_end as usize) - sstable.block_meta_offset;
+        let meta_bytes = sstable
+            .file
+            .read(sstable.block_meta_offset as u64, meta_block_len as u64)?;
+        sstable.block_meta = BlockMeta::decode_block_meta(meta_bytes.as_slice());
+
+        sstable.first_key = sstable.block_meta.first().unwrap().first_key.clone();
+        sstable.last_key = sstable.block_meta.last().unwrap().last_key.clone();
+        Ok(sstable)
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -147,19 +213,61 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if block_idx >= self.block_meta.len() {
+            bail!("block index out of bound");
+        }
+        let block_meta = &self.block_meta[block_idx];
+        let block_start = block_meta.offset as u64;
+        let block_end = if block_idx + 1 == self.block_meta.len() {
+            self.block_meta_offset
+        } else {
+            self.block_meta[block_idx + 1].offset
+        } as u64;
+        let block = self.file.read(block_start, block_end - block_start)?;
+        Ok(Arc::new(Block::decode(block.as_slice())))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if let Ok(block) = self
+            .block_cache
+            .clone()
+            .unwrap()
+            .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+        {
+            return Ok(block.clone());
+        }
+        bail!("error read_block_cached");
     }
 
     /// Find the block that may contain `key`.
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        let mut low = 0;
+        let mut high = self.block_meta.len() as i32 - 1;
+        let mut mid: usize;
+        let mut res = self.block_meta.len();
+
+        while low <= high {
+            mid = ((low + high) / 2) as usize;
+            let curr_key = self.block_meta[mid].last_key.as_key_slice();
+            match key.cmp(&curr_key) {
+                std::cmp::Ordering::Less => {
+                    res = mid;
+                    high = mid as i32 - 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    res = mid;
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    low = mid as i32 + 1;
+                }
+            }
+        }
+
+        res
     }
 
     /// Get number of data blocks.
@@ -185,5 +293,28 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn key_not_included(&self, key_slice: KeySlice) -> bool {
+        if key_slice < self.first_key().as_key_slice() || key_slice > self.last_key().as_key_slice()
+        {
+            return true;
+        }
+        let b = self.bloom.as_ref().unwrap();
+        !b.may_contain(farmhash::fingerprint32(key_slice.raw_ref()))
+    }
+
+    pub fn range_not_included(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        let res = match lower {
+            Bound::Unbounded => false,
+            Bound::Included(e) => KeySlice::from_slice(e) > self.last_key().as_key_slice(),
+            Bound::Excluded(e) => KeySlice::from_slice(e) >= self.last_key().as_key_slice(),
+        };
+
+        res || (match upper {
+            Bound::Unbounded => false,
+            Bound::Included(e) => KeySlice::from_slice(e) < self.first_key().as_key_slice(),
+            Bound::Excluded(e) => KeySlice::from_slice(e) <= self.first_key().as_key_slice(),
+        })
     }
 }

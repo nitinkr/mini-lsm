@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicUsize;
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use nom::AsBytes;
 use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
@@ -122,13 +123,29 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let mut res = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |map: &Arc<SkipMap<Bytes, Bytes>>| {
+                map.range((
+                    lower.map(Bytes::copy_from_slice),
+                    upper.map(Bytes::copy_from_slice),
+                ))
+            },
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        res.next().expect("memtable next can't fail");
+        res
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        for entry in self.map.iter() {
+            let key = KeySlice::from_slice(entry.key().as_bytes());
+            builder.add(key, entry.value());
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
@@ -169,18 +186,23 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &(self.borrow_item().1[..])
     }
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        KeySlice::from_slice(&(self.borrow_item().0[..]))
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let next_entry = self.with_iter_mut(|e| match e.next() {
+            Some(entry) => (entry.key().clone(), entry.value().clone()),
+            None => (Bytes::new(), Bytes::new()),
+        });
+        self.with_item_mut(|item| *item = next_entry);
+        Ok(())
     }
 }

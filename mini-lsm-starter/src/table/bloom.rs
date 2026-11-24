@@ -93,6 +93,15 @@ impl Bloom {
         filter.resize(nbytes, 0);
 
         // TODO: build the bloom filter
+        for hash in keys {
+            let mut h = hash.to_owned();
+            let delta = h.rotate_left(15);
+            for _ in 0..k {
+                let bit = (h as usize) % nbits;
+                filter[bit / 8] |= 1 << (bit % 8);
+                h = h.wrapping_add(delta);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -110,7 +119,12 @@ impl Bloom {
             let delta = h.rotate_left(15);
 
             // TODO: probe the bloom filter
-
+            for _ in 0..self.k {
+                let bit = (h as usize) % nbits;
+                if self.filter[bit / 8] & (1 << (bit % 8)) == 0 {
+                    return false;
+                }
+            }
             true
         }
     }

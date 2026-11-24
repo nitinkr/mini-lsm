@@ -16,25 +16,31 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
+use std::io::ErrorKind;
 
 use crate::block::Block;
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -169,7 +175,8 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).ok();
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -256,6 +263,13 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                bail!("not able to create dir {e}");
+            }
+        }
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -305,6 +319,20 @@ impl LsmStorageInner {
                 return Ok(Some(val).filter(|v| !v.is_empty()));
             }
         }
+
+        // look up in ss tables
+        let key_slice = KeySlice::from_slice(key);
+        for id in state.l0_sstables.iter() {
+            let sst = state.sstables.get(id).unwrap().clone();
+            if sst.key_not_included(key_slice) {
+                continue;
+            }
+            let sst_iter = SsTableIterator::create_and_seek_to_key(sst, key_slice)?;
+            if sst_iter.is_valid() && sst_iter.key() == key_slice {
+                return Ok(Some(Bytes::copy_from_slice(sst_iter.value())).filter(|v| !v.is_empty()));
+            }
+        }
+
         Ok(None)
     }
 
@@ -355,7 +383,7 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut guard = self.state.write();
         let mut snapshot = guard.as_ref().clone();
         let old_memtable = std::mem::replace(
@@ -369,7 +397,37 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+
+        // 1. identify a imm_memtable to flush
+        let state = self.state.read().clone();
+        if state.imm_memtables.is_empty() {
+            return Ok(());
+        }
+
+        let idx = state.imm_memtables.len() - 1;
+        let imm_memtable = state.imm_memtables.last().unwrap().clone();
+
+        imm_memtable.flush(&mut builder)?;
+
+        let sst_id = imm_memtable.id();
+        let sst_path = self.path_of_sst(sst_id);
+
+        let sst = builder.build(sst_id, Some(self.block_cache.clone()), sst_path)?;
+
+        let state_lock = self.state_lock.lock();
+        let mut guard = self.state.write();
+        let mut new_state = guard.as_ref().clone();
+        let imm_memtables = &new_state.imm_memtables;
+        if idx >= imm_memtables.len() || imm_memtables[idx].id() != sst_id {
+            return Ok(());
+        }
+        new_state.imm_memtables.remove(idx);
+        new_state.l0_sstables.insert(0, sst_id);
+        new_state.sstables.insert(sst_id, Arc::new(sst));
+
+        *guard = Arc::new(new_state);
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -380,9 +438,45 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        // collect all memtable iters in a vector
+        let state = self.state.read().clone();
+        let mut mem_iters = vec![Box::new(state.memtable.scan(lower, upper))];
+        for mt in state.imm_memtables.iter() {
+            mem_iters.push(Box::new(mt.scan(lower, upper)));
+        }
+
+        let merge_meme_iter = MergeIterator::create(mem_iters);
+
+        let mut sst_iters = vec![];
+        for idx in &state.l0_sstables {
+            let sst = state.sstables.get(idx).unwrap().clone();
+            if sst.range_not_included(lower, upper) {
+                continue;
+            }
+            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(sst)?));
+        }
+        let mut merge_sst_iter: MergeIterator<SsTableIterator> = MergeIterator::create(sst_iters);
+
+        while merge_sst_iter.is_valid() {
+            let key = merge_sst_iter.key().raw_ref();
+            let skip = match lower {
+                Bound::Unbounded => false,
+                Bound::Included(start) => key < start,
+                Bound::Excluded(start) => key <= start,
+            };
+
+            if skip {
+                merge_sst_iter.next()?;
+            } else {
+                break;
+            }
+        }
+
+        let two_iter = TwoMergeIterator::create(merge_meme_iter, merge_sst_iter)?;
+        let lsm_iter = LsmIterator::new(two_iter, upper.map(Bytes::copy_from_slice))?;
+        Ok(FusedIterator::new(lsm_iter))
     }
 }

@@ -17,8 +17,9 @@
 
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::key::KeySlice;
 
@@ -59,7 +60,16 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap: BinaryHeap<HeapWrapper<I>> = BinaryHeap::new();
+        for (id, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(id, iter));
+            }
+        }
+        MergeIterator {
+            iters: heap,
+            current: None,
+        }
     }
 }
 
@@ -69,18 +79,42 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.iters.peek().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iters.peek().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.iters.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            bail!("next is called on an invalid iterator");
+        }
+
+        let curr_key = self.key().to_key_vec();
+        while self.is_valid() {
+            if let Some(mut iter) = self.iters.peek_mut() {
+                if iter.1.key() != curr_key.as_key_slice() {
+                    break;
+                }
+                if let Err(e) = iter.1.next() {
+                    PeekMut::pop(iter);
+                    return Err(e);
+                }
+
+                if !iter.1.is_valid() {
+                    PeekMut::pop(iter);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iters.len()
     }
 }

@@ -24,6 +24,7 @@ use super::StorageIterator;
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
+    pick_from_a: bool,
     // Add fields as need
 }
 
@@ -33,7 +34,35 @@ impl<
 > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut iter = TwoMergeIterator {
+            a,
+            b,
+            pick_from_a: true,
+        };
+        iter.init()?;
+        Ok(iter)
+    }
+
+    fn init(&mut self) -> Result<()> {
+        // calibrate
+        // we don't need a while loop because keys from a given iterator can't be duplicates.
+        self.pick_from_a = self.a.is_valid();
+        if self.a.is_valid() && self.b.is_valid() {
+            let cmp = self.a.key().cmp(&(self.b.key()));
+            match cmp {
+                std::cmp::Ordering::Equal => {
+                    self.b.next()?;
+                    self.pick_from_a = true;
+                }
+                std::cmp::Ordering::Less => {
+                    self.pick_from_a = true;
+                }
+                std::cmp::Ordering::Greater => {
+                    self.pick_from_a = false;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -45,18 +74,46 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.pick_from_a {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.pick_from_a {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.is_valid() {
+            if self.pick_from_a {
+                self.a.next()?;
+            } else {
+                self.b.next()?;
+            }
+            self.init()?;
+        }
+
+        Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        let mut res: usize = 0;
+        if self.a.is_valid() {
+            res += self.a.num_active_iterators();
+        }
+        if self.b.is_valid() {
+            res += self.b.num_active_iterators();
+        }
+        res
     }
 }

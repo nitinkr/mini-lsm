@@ -21,7 +21,13 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::{BlockMeta, SsTable};
-use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
+use crate::{
+    block::BlockBuilder,
+    key::{KeyBytes, KeySlice},
+    lsm_storage::BlockCache,
+    table::{FileObject, bloom::Bloom},
+};
+use bytes::BufMut;
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
@@ -31,12 +37,21 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hash: Vec<u32>,
 }
 
 impl SsTableBuilder {
     /// Create a builder based on target block size.
     pub fn new(block_size: usize) -> Self {
-        unimplemented!()
+        SsTableBuilder {
+            builder: BlockBuilder::new(block_size),
+            first_key: vec![],
+            last_key: vec![],
+            data: vec![],
+            meta: vec![],
+            block_size,
+            key_hash: vec![],
+        }
     }
 
     /// Adds a key-value pair to SSTable.
@@ -44,7 +59,17 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
-        unimplemented!()
+        if !self.builder.add(key, value) {
+            self.flush();
+            let res = self.builder.add(key, value);
+            assert!(res, "add in block builder should succeeded");
+        }
+        self.key_hash.push(farmhash::fingerprint32(key.raw_ref()));
+        if self.first_key.is_empty() {
+            self.first_key.extend_from_slice(key.raw_ref());
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key.raw_ref());
     }
 
     /// Get the estimated size of the SSTable.
@@ -52,7 +77,7 @@ impl SsTableBuilder {
     /// Since the data blocks contain much more data than meta blocks, just return the size of data
     /// blocks here.
     pub fn estimated_size(&self) -> usize {
-        unimplemented!()
+        self.builder.size() + self.data.len()
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
@@ -62,11 +87,44 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        unimplemented!()
+        self.flush();
+        let block_offset = self.data.len();
+        BlockMeta::encode_block_meta(&self.meta, &mut self.data);
+        self.data.put_u32(block_offset as u32);
+
+        let bloom_offset = self.data.len();
+        let bloom = Bloom::build_from_key_hashes(self.key_hash.as_ref(), 8);
+        bloom.encode(&mut self.data);
+        self.data.put_u32(bloom_offset as u32);
+
+        let file = FileObject::create(path.as_ref(), self.data)?;
+
+        Ok(SsTable {
+            file,
+            block_meta: self.meta,
+            block_meta_offset: block_offset,
+            id,
+            block_cache,
+            first_key: KeyBytes::from_bytes(self.first_key.into()),
+            last_key: KeyBytes::from_bytes(self.last_key.into()),
+            bloom: Some(bloom),
+            max_ts: 0,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn build_for_test(self, path: impl AsRef<Path>) -> Result<SsTable> {
         self.build(0, None, path)
+    }
+
+    fn flush(&mut self) {
+        let old_builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
+        let old_block = old_builder.build();
+        self.meta.push(BlockMeta {
+            offset: self.data.len(),
+            first_key: old_block.extract_key(0),
+            last_key: old_block.extract_key(old_block.offsets.len() - 1),
+        });
+        self.data.extend_from_slice(&old_block.encode());
     }
 }
